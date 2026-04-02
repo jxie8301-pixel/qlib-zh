@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# =============================================================================
+# run_alpha158_practice — 周度实盘选股辅助脚本
+# 用法: bash run_alpha158_practice <experiment_name> [stage=N] [end_stage=N]
+# 示例: bash run_alpha158_practice myexp_20260401 stage=0 end_stage=6
+#       bash run_alpha158_practice myexp_20260401 stage=2  # 仅执行 stage2
+# =============================================================================
+set -euo pipefail
+
+# ──────────────────────────────────────────────
+# 0. 参数解析
+# ──────────────────────────────────────────────
+if [[ $# -lt 1 ]]; then
+  echo "Usage: bash run_alpha158_practice <experiment_name> [stage=N] [end_stage=N]" >&2
+  echo "       N: 1-6 (default start=1  end=6)" >&2
+  exit 1
+fi
+
+EXP_NAME="$1"
+shift
+
+START_STAGE=1
+END_STAGE=6
+
+for arg in "$@"; do
+  case "$arg" in
+    stage=*)     START_STAGE="${arg#stage=}" ;;
+    end_stage=*) END_STAGE="${arg#end_stage=}" ;;
+    *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+  esac
+done
+
+# ──────────────────────────────────────────────
+# 1. 全局路径 / 常量
+# ──────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_ROOT="$SCRIPT_DIR/DATA/analysis_outputs"
+OUT_DIR="$OUT_ROOT/$EXP_NAME"
+LOG_DIR="$OUT_DIR/logs"
+QDATA_HOST_DIR="${QLIB_HOST_DATA_DIR:-$HOME/.qlib}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-qlib-rdagent:latest}"
+WORKDIR_IN_CONTAINER="/work"
+OUT_DIR_IN_CONTAINER="$WORKDIR_IN_CONTAINER/DATA/analysis_outputs/$EXP_NAME"
+PRACTICE_SCRIPTS="$SCRIPT_DIR/scripts/practice"
+
+# 实盘账户参数（供子脚本读取）
+export CASH_TOTAL=20000
+export TX_FEE_RATE=0.0001        # 万分之一
+export STAMP_DUTY_RATE=0.0005    # 万分之五
+export HOLD_NUM=5                 # 始终持有5支
+
+# ──────────────────────────────────────────────
+# 2. 日期计算（基于 T = 今天/本周五）
+# ──────────────────────────────────────────────
+# macOS date 与 GNU date 兼容处理
+_date_offset() {
+  local base="$1"   # YYYY-MM-DD
+  local days="$2"   # 正数=向后, 负数=向前 (天)
+  if date --version >/dev/null 2>&1; then
+    # GNU date
+    date -d "$base $days days" +%Y-%m-%d
+  else
+    # macOS BSD date: 正数必须带 + 号，否则 -v2d 会被解释为"设置日期为2号"
+    local flag
+    if (( days >= 0 )); then
+      flag="+${days}d"
+    else
+      flag="${days}d"
+    fi
+    date -j -v"$flag" -f "%Y-%m-%d" "$base" +%Y-%m-%d
+  fi
+}
+
+_date_offset_years() {
+  local base="$1"
+  local years="$2"
+  if date --version >/dev/null 2>&1; then
+    date -d "$base $years years" +%Y-%m-%d
+  else
+    local flag
+    if (( years >= 0 )); then
+      flag="+${years}y"
+    else
+      flag="${years}y"
+    fi
+    date -j -v"$flag" -f "%Y-%m-%d" "$base" +%Y-%m-%d
+  fi
+}
+
+# 找"本周五（T）"：如果今天是周五就用今天，否则找最近的周五
+_this_friday() {
+  local today
+  today="$(date +%Y-%m-%d)"
+  local dow
+  dow="$(date +%u)"   # 1=Mon … 7=Sun
+  local diff=$(( 5 - dow ))
+  if (( diff < 0 )); then diff=$(( diff + 7 )); fi
+  _date_offset "$today" "$diff"
+}
+
+T="$(_this_friday)"
+
+# 训练集: [T-3年] ~ [T-1周-1天] = 上周四
+T_MINUS_3Y="$(_date_offset_years "$T" -3)"
+T_MINUS_1W1D="$(_date_offset "$T" -8)"   # 1周+1天=8天前
+# 验证集: [T-1周] ~ [T-1天] = 上周五 ~ 本周四
+T_MINUS_1W="$(_date_offset "$T" -7)"
+T_MINUS_1D="$(_date_offset "$T" -1)"
+# 预测集: T 本周五
+PRED_DATE="$T"
+
+export T T_MINUS_3Y T_MINUS_1W1D T_MINUS_1W T_MINUS_1D PRED_DATE
+export EXP_NAME OUT_DIR SCRIPT_DIR DOCKER_IMAGE WORKDIR_IN_CONTAINER QDATA_HOST_DIR OUT_DIR_IN_CONTAINER
+
+# 创建所有输出目录
+mkdir -p "$LOG_DIR"
+mkdir -p "$OUT_DIR/model_predict"
+mkdir -p "$OUT_DIR/first_screen"
+mkdir -p "$OUT_DIR/risk_eval"
+mkdir -p "$OUT_DIR/second_screen"
+mkdir -p "$OUT_DIR/final_result"
+
+echo "============================================================"
+echo "  run_alpha158_practice"
+echo "  experiment : $EXP_NAME"
+echo "  T (本周五) : $T"
+echo "  训练集     : $T_MINUS_3Y ~ $T_MINUS_1W1D"
+echo "  验证集     : $T_MINUS_1W ~ $T_MINUS_1D"
+echo "  预测集     : $PRED_DATE"
+echo "  stage      : $START_STAGE → $END_STAGE"
+echo "  output     : $OUT_DIR"
+echo "============================================================"
+
+# ──────────────────────────────────────────────
+# Stage 函数定义
+# ──────────────────────────────────────────────
+
+run_stage1() {
+  echo ""
+  echo "╔══════════════════════════════════════════╗"
+  echo "║  STAGE 1 — 更新 qlib 数据至 T           ║"
+  echo "╚══════════════════════════════════════════╝"
+  local log="$LOG_DIR/stage1.log"
+
+  (
+    set -euo pipefail
+
+    echo "[1/4] 下载最新 qlib 数据 (chenditc/investment_data)"
+    wget -q --show-progress \
+      https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz \
+      -O /tmp/qlib_bin.tar.gz
+
+    echo "[2/4] 创建目标目录"
+    mkdir -p "$QDATA_HOST_DIR/qlib_data/cn_data"
+
+    echo "[3/4] 解压数据"
+    tar -zxvf /tmp/qlib_bin.tar.gz \
+        -C "$QDATA_HOST_DIR/qlib_data/cn_data" \
+        --strip-components=1 2>&1 | tail -5
+    rm -f /tmp/qlib_bin.tar.gz
+
+    echo "[4/4] 检查数据健康状态"
+    python "$SCRIPT_DIR/scripts/check_data_health.py" \
+        check_data \
+        --qlib_dir "$QDATA_HOST_DIR/qlib_data/cn_data"
+
+    echo "✓ Stage1 完成 — 数据已更新至 $T"
+  ) 2>&1 | tee "$log"
+}
+
+run_stage2() {
+  echo ""
+  echo "╔══════════════════════════════════════════╗"
+  echo "║  STAGE 2 — 训练模型 & 生成预测得分      ║"
+  echo "╚══════════════════════════════════════════╝"
+  local log="$LOG_DIR/stage2.log"
+
+  (
+    set -euo pipefail
+
+    local YAML_SRC="$SCRIPT_DIR/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158.yaml"
+    local YAML_PRACTICE="$OUT_DIR/workflow_config_practice.yaml"
+    local PRED_OUT="$OUT_DIR/model_predict"
+
+    # 1. 生成本次实验专用 YAML
+    echo "[1/4] 生成 practice YAML: $YAML_PRACTICE"
+    python3 "$PRACTICE_SCRIPTS/gen_practice_yaml.py" \
+        --template "$YAML_SRC" \
+        --output   "$YAML_PRACTICE" \
+        --train-start  "$T_MINUS_3Y" \
+        --train-end    "$T_MINUS_1W1D" \
+        --valid-start  "$T_MINUS_1W" \
+        --valid-end    "$T_MINUS_1D" \
+        --test-start   "$PRED_DATE" \
+        --test-end     "$PRED_DATE"
+
+    echo "[2/4] 启动 Docker 容器并运行 qrun"
+    PIPELINE_START_TS="$(date +%s)"
+    docker run --rm \
+      -e GM_TOKEN \
+        -v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+        -v "$QDATA_HOST_DIR:/root/.qlib" \
+        -w "$WORKDIR_IN_CONTAINER" \
+        "$DOCKER_IMAGE" \
+        /bin/bash -lc "set -euo pipefail; qrun 'DATA/analysis_outputs/$EXP_NAME/workflow_config_practice.yaml'"
+
+    echo "[3/4] 定位本次 MLflow run 产物目录"
+    LATEST_RUN_DIR="$(PIPELINE_START_TS="$PIPELINE_START_TS" SCRIPT_DIR="$SCRIPT_DIR" python3 - <<'PY'
+import os
+from pathlib import Path
+start_ts = float(os.environ["PIPELINE_START_TS"])
+root = Path(os.environ["SCRIPT_DIR"]) / "mlruns"
+candidates = []
+for p in root.glob("*/*/artifacts/pred.pkl"):
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        continue
+    candidates.append((st.st_mtime, str(p.parents[1].resolve())))
+if not candidates:
+    raise SystemExit("No pred.pkl found in mlruns")
+fresh = [x for x in candidates if x[0] >= start_ts - 5]
+pool = fresh if fresh else candidates
+print(max(pool)[1])
+PY
+)"
+
+    cp -R "$LATEST_RUN_DIR" "$OUT_DIR/mlflow_run"
+    echo "MLflow run dir: $LATEST_RUN_DIR"
+
+    echo "[4/4] 将预测结果 + 绩效指标导出为 CSV"
+    python3 "$PRACTICE_SCRIPTS/export_model_predict.py" \
+        --run-dir "$OUT_DIR/mlflow_run" \
+        --output  "$PRED_OUT" \
+        --pred-date "$PRED_DATE"
+
+    echo "✓ Stage2 完成 — 预测结果保存在: $PRED_OUT"
+  ) 2>&1 | tee "$log"
+}
+
+run_stage3() {
+  echo ""
+  echo "╔══════════════════════════════════════════╗"
+  echo "║  STAGE 3 — 初筛选股（流动性/可交易性）  ║"
+  echo "╚══════════════════════════════════════════╝"
+  local log="$LOG_DIR/stage3.log"
+
+  (
+    set -euo pipefail
+    docker run --rm \
+      --platform linux/amd64 \
+      -e GM_TOKEN \
+      -e PYTHONPATH=/work/scripts/practice \
+      -e PRED_DATE \
+        -v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+        -v "$QDATA_HOST_DIR:/root/.qlib" \
+        -w /tmp \
+        "$DOCKER_IMAGE" \
+        python3 /work/scripts/practice/stage3_first_screen.py \
+        --pred-dir  "$OUT_DIR_IN_CONTAINER/model_predict" \
+        --output    "$OUT_DIR_IN_CONTAINER/first_screen" \
+        --pred-date "$PRED_DATE" \
+        --top-n     20 \
+        --max-price 50
+    echo "✓ Stage3 完成 — 初筛结果保存在: $OUT_DIR/first_screen"
+  ) 2>&1 | tee "$log"
+}
+
+run_stage4() {
+  echo ""
+  echo "╔══════════════════════════════════════════╗"
+  echo "║  STAGE 4 — 估值 & 风险标签              ║"
+  echo "╚══════════════════════════════════════════╝"
+  local log="$LOG_DIR/stage4.log"
+
+  (
+    set -euo pipefail
+    docker run --rm \
+      --platform linux/amd64 \
+        -e OUT_DIR_IN_CONTAINER \
+        -e PRED_DATE \
+        -v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+        -v "$QDATA_HOST_DIR:/root/.qlib" \
+        -w "$WORKDIR_IN_CONTAINER" \
+        "$DOCKER_IMAGE" \
+      bash -lc 'set -euo pipefail; python3 - <<"PY"
+import importlib.util
+import subprocess
+import sys
+if importlib.util.find_spec("baostock") is None:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "baostock"])
+PY
+python3 scripts/practice/stage4_risk_eval.py --input "$OUT_DIR_IN_CONTAINER/first_screen/first_screen.csv" --output "$OUT_DIR_IN_CONTAINER/risk_eval" --pred-date "$PRED_DATE"'
+    echo "✓ Stage4 完成 — 风险评估保存在: $OUT_DIR/risk_eval"
+  ) 2>&1 | tee "$log"
+}
+
+run_stage5() {
+  echo ""
+  echo "╔══════════════════════════════════════════╗"
+  echo "║  STAGE 5 — 二筛（过滤高风险/高估值）    ║"
+  echo "╚══════════════════════════════════════════╝"
+  local log="$LOG_DIR/stage5.log"
+
+  (
+    set -euo pipefail
+    docker run --rm \
+        -v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+        -v "$QDATA_HOST_DIR:/root/.qlib" \
+        -w "$WORKDIR_IN_CONTAINER" \
+        "$DOCKER_IMAGE" \
+        python3 scripts/practice/stage5_second_screen.py \
+        --risk-eval "$OUT_DIR_IN_CONTAINER/risk_eval/risk_eval.csv" \
+        --pred-dir  "$OUT_DIR_IN_CONTAINER/model_predict" \
+        --output    "$OUT_DIR_IN_CONTAINER/second_screen" \
+        --hold-num  "$HOLD_NUM"
+    echo "✓ Stage5 完成 — 二筛结果保存在: $OUT_DIR/second_screen"
+  ) 2>&1 | tee "$log"
+}
+
+run_stage6() {
+  echo ""
+  echo "╔══════════════════════════════════════════╗"
+  echo "║  STAGE 6 — 最终结果 & 调仓建议          ║"
+  echo "╚══════════════════════════════════════════╝"
+  local log="$LOG_DIR/stage6.log"
+
+  (
+    set -euo pipefail
+    docker run --rm \
+        -v "$SCRIPT_DIR:$WORKDIR_IN_CONTAINER" \
+        -v "$QDATA_HOST_DIR:/root/.qlib" \
+        -w "$WORKDIR_IN_CONTAINER" \
+        "$DOCKER_IMAGE" \
+        python3 scripts/practice/stage6_final_result.py \
+        --second-screen "$OUT_DIR_IN_CONTAINER/second_screen/second_screen.csv" \
+        --pred-dir      "$OUT_DIR_IN_CONTAINER/model_predict" \
+        --output        "$OUT_DIR_IN_CONTAINER/final_result" \
+        --hold-num      "$HOLD_NUM" \
+        --bottom-pct    0.30
+    echo "✓ Stage6 完成 — 最终结果保存在: $OUT_DIR/final_result"
+  ) 2>&1 | tee "$log"
+}
+
+# ──────────────────────────────────────────────
+# 执行调度
+# ──────────────────────────────────────────────
+for stage in $(seq "$START_STAGE" "$END_STAGE"); do
+  case "$stage" in
+    1) run_stage1 ;;
+    2) run_stage2 ;;
+    3) run_stage3 ;;
+    4) run_stage4 ;;
+    5) run_stage5 ;;
+    6) run_stage6 ;;
+    *) echo "Ignoring stage: $stage" >&2;;
+  esac
+done
+
+echo ""
+echo "============================================================"
+echo "  全部阶段执行完毕"
+echo "  输出目录: $OUT_DIR"
+echo "============================================================"

@@ -1,0 +1,22 @@
+services:
+  rdagent:
+    image: qlib-rdagent:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        IS_STABLE: "no"
+    env_file:
+      - .env
+    environment:
+      CONDA_DEFAULT_ENV: qlib_env
+      DOCKER_HOST: unix:///var/run/docker.sock
+    working_dir: /Users/apple/github/qlib
+    tty: true
+    stdin_open: true
+    volumes:
+      - /Users/apple/github/qlib:/Users/apple/github/qlib
+      - ./git_ignore_folder:/data/git_ignore_folder
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: ["/bin/bash", "/Users/apple/github/qlib/docker-entrypoint.sh"]
+    command: ["sleep", "infinity"]
