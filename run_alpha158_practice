@@ -48,6 +48,8 @@ export CASH_TOTAL=20000
 export TX_FEE_RATE=0.0001        # 万分之一
 export STAMP_DUTY_RATE=0.0005    # 万分之五
 export HOLD_NUM=5                 # 始终持有5支
+# 当前扫参最优：63 天半衰期
+export SAMPLE_WEIGHT_HALF_LIFE="${SAMPLE_WEIGHT_HALF_LIFE:-63}"
 
 # ──────────────────────────────────────────────
 # 2. 日期计算（基于 T = 今天/本周五）
@@ -100,22 +102,28 @@ _this_friday() {
 
 T="$(_this_friday)"
 
-# 最近 5 年滚动窗口：
-# - train : 最近 5 年历史数据，避开最近 2 周
-# - valid : 最近第 2 个 1 周窗口
-# - test  : 最近第 1 个 1 周窗口
+# 最近 5 年 + 1 年 + 1 周滚动窗口：
+# - train : 最近 5 年历史数据
+# - valid : 最近 1 年历史数据
+# - test  : 最近 1 周历史数据
 #
-# 约束：train / valid / test 严格不重叠，且整体数据仅来自最近 5 年+
-# 2 周缓冲区；预测日期取最近一个完整 test 窗口的结束日。
-TRAIN_START="$(_date_offset_years "$T" -5)"
-TRAIN_END="$(_date_offset "$T" -15)"    # test 前 2 周的前 1 天
-VALID_START="$(_date_offset "$T" -14)"  # 最近第 2 周窗口开始
-VALID_END="$(_date_offset "$T" -8)"      # 最近第 2 周窗口结束
-TEST_START="$(_date_offset "$T" -7)"     # 最近第 1 周窗口开始
-TEST_END="$(_date_offset "$T" -1)"       # 最近第 1 周窗口结束
+# 约束：train / valid / test 严格不重叠；整体数据从 2008-01-01 起回溯。
+TRAIN_BASE_START="2008-01-01"
+TEST_START="$(_date_offset "$T" -7)"      # 最近 1 周窗口开始
+TEST_END="$(_date_offset "$T" -1)"        # 最近 1 周窗口结束
+VALID_END="$(_date_offset "$TEST_START" -1)"   # test 前 1 天
+VALID_START="$(_date_offset_years "$VALID_END" -1)"
+TRAIN_END="$(_date_offset "$VALID_START" -1)"   # valid 前 1 天
+TRAIN_START_RAW="$(_date_offset_years "$TRAIN_END" -5)"
+if [[ "$TRAIN_START_RAW" < "$TRAIN_BASE_START" ]]; then
+  TRAIN_START="$TRAIN_BASE_START"
+else
+  TRAIN_START="$TRAIN_START_RAW"
+fi
 PRED_DATE="$TEST_END"
 
 export T TRAIN_START TRAIN_END VALID_START VALID_END TEST_START TEST_END PRED_DATE
+export TRAIN_BASE_START TRAIN_START_RAW
 export EXP_NAME OUT_DIR SCRIPT_DIR DOCKER_IMAGE WORKDIR_IN_CONTAINER QDATA_HOST_DIR OUT_DIR_IN_CONTAINER
 
 # 创建所有输出目录
@@ -134,6 +142,7 @@ echo "  训练集     : $TRAIN_START ~ $TRAIN_END"
 echo "  验证集     : $VALID_START ~ $VALID_END"
 echo "  测试集     : $TEST_START ~ $TEST_END"
 echo "  预测日期   : $PRED_DATE"
+echo "  半衰期     : $SAMPLE_WEIGHT_HALF_LIFE"
 echo "  stage      : $START_STAGE → $END_STAGE"
 echo "  output     : $OUT_DIR"
 echo "============================================================"
@@ -195,6 +204,8 @@ run_stage2() {
         --template "$YAML_SRC" \
         --output   "$YAML_PRACTICE" \
       --model-mode robust \
+      --data-start "$TRAIN_BASE_START" \
+      --sample-weight-half-life "$SAMPLE_WEIGHT_HALF_LIFE" \
       --train-start  "$TRAIN_START" \
       --train-end    "$TRAIN_END" \
       --valid-start  "$VALID_START" \
@@ -202,7 +213,7 @@ run_stage2() {
       --test-start   "$TEST_START" \
       --test-end     "$TEST_END"
 
-    echo "[2/4] 启动 Docker 容器并运行 qrun"
+    echo "[2/4] 启动 Docker 容器并运行 stage2 训练脚本"
     PIPELINE_START_TS="$(date +%s)"
     docker run --rm \
       -e GM_TOKEN \
@@ -210,7 +221,12 @@ run_stage2() {
         -v "$QDATA_HOST_DIR:/root/.qlib" \
         -w "$WORKDIR_IN_CONTAINER" \
         "$DOCKER_IMAGE" \
-        /bin/bash -lc "set -euo pipefail; qrun 'DATA/analysis_outputs/$EXP_NAME/workflow_config_practice.yaml'"
+        python3 scripts/practice/run_stage2_practice.py \
+        --config "DATA/analysis_outputs/$EXP_NAME/workflow_config_practice.yaml" \
+        --experiment-name "$EXP_NAME" \
+        --uri-folder mlruns \
+        --half-life "$SAMPLE_WEIGHT_HALF_LIFE" \
+        --floor 0.2
 
     echo "[3/4] 定位本次 MLflow run 产物目录"
     LATEST_RUN_DIR="$(PIPELINE_START_TS="$PIPELINE_START_TS" SCRIPT_DIR="$SCRIPT_DIR" python3 - <<'PY'

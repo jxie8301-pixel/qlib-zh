@@ -6,6 +6,7 @@ gen_practice_yaml.py
 import argparse
 import re
 import sys
+import os
 from pathlib import Path
 
 import yaml
@@ -25,7 +26,7 @@ def validate_date_order(dates: dict) -> None:
             )
 
 
-def _apply_model_mode(doc: dict, model_mode: str) -> None:
+def _apply_model_mode(doc: dict, model_mode: str, sample_weight_half_life: int | None = None) -> None:
     """Adjust LightGBM hyperparameters for a given stage2 regime."""
     if model_mode == "default":
         return
@@ -50,7 +51,14 @@ def _apply_model_mode(doc: dict, model_mode: str) -> None:
         raise ValueError(f"Unknown model_mode: {model_mode}")
 
 
-def patch_yaml(template_path: str, output_path: str, dates: dict, model_mode: str = "default") -> None:
+def patch_yaml(
+    template_path: str,
+    output_path: str,
+    dates: dict,
+    model_mode: str = "default",
+    data_start: str | None = None,
+    sample_weight_half_life: int | None = None,
+) -> None:
     validate_date_order(dates)
 
     with open(template_path, "r", encoding="utf-8") as f:
@@ -63,12 +71,12 @@ def patch_yaml(template_path: str, output_path: str, dates: dict, model_mode: st
     # ──────────────────────────────────────────
     dh = doc.get("data_handler_config", {})
     # handler 的全局时间范围覆盖训练+验证+测试
-    dh["start_time"]     = dates["train_start"]
+    dh["start_time"]     = data_start or dates["train_start"]
     dh["end_time"]       = dates["test_end"]
     dh["fit_start_time"] = dates["train_start"]
     dh["fit_end_time"]   = dates["train_end"]
 
-    _apply_model_mode(doc, model_mode)
+    _apply_model_mode(doc, model_mode, sample_weight_half_life=sample_weight_half_life)
 
     # ──────────────────────────────────────────
     # 2. 更新 dataset segments
@@ -120,7 +128,17 @@ def main():
     ap.add_argument("--test-start",  required=True, dest="test_start")
     ap.add_argument("--test-end",    required=True, dest="test_end")
     ap.add_argument("--model-mode", choices=["default", "robust"], default="default", dest="model_mode")
+    ap.add_argument("--data-start", default=None, dest="data_start")
+    ap.add_argument("--sample-weight-half-life", type=int, default=None, dest="sample_weight_half_life")
     args = ap.parse_args()
+
+    sample_weight_half_life = args.sample_weight_half_life
+    if sample_weight_half_life is None:
+        env_half_life = os.getenv("SAMPLE_WEIGHT_HALF_LIFE", "").strip()
+        sample_weight_half_life = int(env_half_life) if env_half_life else None
+
+    if sample_weight_half_life is not None and sample_weight_half_life <= 0:
+        raise ValueError("sample_weight_half_life must be positive")
 
     patch_yaml(
         args.template,
@@ -134,6 +152,8 @@ def main():
             "test_end":    args.test_end,
         },
         model_mode=args.model_mode,
+        data_start=getattr(args, "data_start", None),
+        sample_weight_half_life=sample_weight_half_life,
     )
 
 
