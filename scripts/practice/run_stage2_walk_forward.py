@@ -1065,6 +1065,162 @@ def _signal_coverage_diagnostics(trade_signal: pd.DataFrame, calendar: pd.Dateti
     }
 
 
+def _fold_pred_date(fold_output: Path) -> str | None:
+    scores_csv = fold_output / "scores.csv"
+    if not scores_csv.exists():
+        return None
+    try:
+        df = pd.read_csv(scores_csv, usecols=lambda c: c in {"pred_date", "date"})
+    except Exception:
+        return None
+    for col in ["pred_date", "date"]:
+        if col in df.columns and not df[col].dropna().empty:
+            return str(df[col].dropna().astype(str).iloc[0])
+    return None
+
+
+def _stage36_replay_signal_from_fold(
+    fold_output: Path,
+    replay_dir: Path,
+    pred_date: str,
+    hold_num: int,
+) -> pd.DataFrame:
+    """Replay stage3~stage6 for one fold and convert the final portfolio into a trade signal."""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from scripts.practice.stage3_first_screen import first_screen
+    from scripts.practice.stage4_risk_eval import risk_eval
+    from scripts.practice.stage5_second_screen import second_screen
+    from scripts.practice.stage6_final_result import final_result
+
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    stage3_dir = replay_dir / "stage3_first_screen"
+    stage4_dir = replay_dir / "stage4_risk_eval"
+    stage5_dir = replay_dir / "stage5_second_screen"
+    stage6_dir = replay_dir / "stage6_final_result"
+
+    # Run the downstream chain directly through callable functions.
+    first_screen(str(fold_output), str(stage3_dir), pred_date, top_n=20, max_price=float(os.environ.get("MAX_STOCK_PRICE", 50.0)))
+    risk_eval(str(stage3_dir / "first_screen.csv"), str(stage4_dir), pred_date)
+    second_screen(str(stage4_dir / "risk_eval.csv"), str(fold_output), str(stage5_dir), hold_num=hold_num)
+    final_result(str(stage5_dir / "second_screen.csv"), str(fold_output), str(stage6_dir), hold_num=hold_num)
+
+    result_update_csv = stage6_dir / "result_update.csv"
+    if not result_update_csv.exists():
+        raise FileNotFoundError(f"stage6 replay did not produce result_update.csv under {stage6_dir}")
+
+    result_update = pd.read_csv(result_update_csv)
+    if result_update.empty:
+        return pd.DataFrame(columns=["score"])
+    if "code" not in result_update.columns:
+        raise RuntimeError(f"stage6 replay output missing code column: {result_update_csv}")
+
+    score_col = "weight" if "weight" in result_update.columns else None
+    if score_col is None:
+        score_col = "risk_parity_weight" if "risk_parity_weight" in result_update.columns else None
+    if score_col is None:
+        score_col = "score" if "score" in result_update.columns else None
+    if score_col is None:
+        result_update["score"] = 1.0
+        score_col = "score"
+
+    trade_dt = pd.to_datetime(pred_date)
+    out = result_update.copy()
+    out["datetime"] = trade_dt
+    out["instrument"] = out["code"].astype(str)
+    out["score"] = pd.to_numeric(out[score_col], errors="coerce").fillna(0.0)
+    out = out[["datetime", "instrument", "score"]].dropna(subset=["datetime", "instrument", "score"])
+    return out
+
+
+def _build_stage36_full_signal(
+    fold_outputs: list[Path],
+    output_root: Path,
+    hold_num: int,
+) -> pd.DataFrame:
+    """Build a replay signal from stage3~stage6 outputs on each fold."""
+    replay_root = output_root / "full_backtest" / "stage36_replay"
+    frames: list[pd.DataFrame] = []
+
+    for fold_output in fold_outputs:
+        pred_date = _fold_pred_date(fold_output)
+        if not pred_date:
+            continue
+        fold_tag = fold_output.parent.name
+        replay_dir = replay_root / fold_tag
+        try:
+            df = _stage36_replay_signal_from_fold(
+                fold_output=fold_output,
+                replay_dir=replay_dir,
+                pred_date=pred_date,
+                hold_num=hold_num,
+            )
+        except Exception as exc:
+            print(f"  ⚠ stage3~stage6 replay failed for fold {fold_tag}: {exc}")
+            continue
+        if not df.empty:
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(columns=["score"])
+
+    signal_df = pd.concat(frames, ignore_index=True)
+    signal_df = signal_df.drop_duplicates(subset=["datetime", "instrument"], keep="last")
+    signal_df = signal_df.sort_values(["datetime", "instrument"])
+    signal_df = signal_df.set_index(["datetime", "instrument"])[["score"]]
+    signal_df.index = signal_df.index.set_names(["datetime", "instrument"])
+    return signal_df
+
+
+def _apply_price_cap_to_trade_signal(trade_signal: pd.DataFrame, price_cap: float = 50.0) -> pd.DataFrame:
+    """Exclude instruments whose close price is above the cap on the trade date."""
+    if trade_signal.empty:
+        return trade_signal
+
+    from qlib.data import D
+
+    df = trade_signal.reset_index().copy()
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["instrument"] = df["instrument"].astype(str)
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    df = df.dropna(subset=["datetime", "instrument", "score"])
+    if df.empty:
+        return trade_signal.iloc[0:0]
+
+    instruments = sorted(df["instrument"].astype(str).unique().tolist())
+    start_time = pd.Timestamp(df["datetime"].min()).strftime("%Y-%m-%d")
+    end_time = pd.Timestamp(df["datetime"].max()).strftime("%Y-%m-%d")
+    close_df = D.features(instruments, ["$close"], start_time=start_time, end_time=end_time)
+    if close_df is None or len(close_df) == 0:
+        return trade_signal
+
+    if isinstance(close_df, pd.Series):
+        close_df = close_df.to_frame("close")
+    else:
+        close_df = close_df.copy()
+    if isinstance(close_df.index, pd.MultiIndex):
+        close_df = close_df.reset_index()
+    if "datetime" not in close_df.columns or "instrument" not in close_df.columns:
+        return trade_signal
+    close_col = "close" if "close" in close_df.columns else close_df.columns[-1]
+    close_df["datetime"] = pd.to_datetime(close_df["datetime"], errors="coerce")
+    close_df["instrument"] = close_df["instrument"].astype(str)
+    close_df[close_col] = pd.to_numeric(close_df[close_col], errors="coerce")
+    close_df = close_df[["datetime", "instrument", close_col]].dropna()
+    close_df = close_df.rename(columns={close_col: "close"})
+
+    merged = df.merge(close_df, on=["datetime", "instrument"], how="left")
+    merged = merged[pd.to_numeric(merged["close"], errors="coerce").fillna(np.inf) <= float(price_cap)]
+    if merged.empty:
+        return trade_signal.iloc[0:0]
+
+    merged = merged.drop(columns=["close"]).drop_duplicates(subset=["datetime", "instrument"], keep="last")
+    merged = merged.sort_values(["datetime", "instrument"])
+    merged = merged.set_index(["datetime", "instrument"])[["score"]]
+    merged.index = merged.index.set_names(["datetime", "instrument"])
+    return merged
+
+
 def _write_full_backtest_report(
     output_root: Path,
     analysis_root: Path,
@@ -1079,6 +1235,7 @@ def _write_full_backtest_report(
     from qlib.config import C
     import qlib
 
+    # Use raw stage2 fold predictions only.
     signal_df = _build_full_signal(fold_outputs)
     full_dir = output_root / "full_backtest"
     full_dir.mkdir(parents=True, exist_ok=True)
@@ -1145,13 +1302,15 @@ def _write_full_backtest_report(
     shifted = shifted.drop(columns=["datetime"]).rename(columns={"trade_datetime": "datetime"})
     shifted = shifted.drop_duplicates(subset=["datetime", "instrument"], keep="last")
     shifted_signal = shifted.set_index(["datetime", "instrument"])[["score"]].sort_index()
+    shifted_signal = _apply_price_cap_to_trade_signal(shifted_signal, price_cap=50.0)
     if shifted_signal.empty:
         report_txt.write_text(
-            "Signal data exists, but no next-trading-day execution dates are available for full-cycle backtest.",
+            "Signal data exists, but no eligible trade dates remain after applying the price cap.",
             encoding="utf-8",
         )
         return
     signal_series = shifted_signal["score"]
+    weekly_signal = shifted_signal.reset_index().copy()
     weekly_signal.to_csv(full_dir / "signal.csv", index=False, encoding="utf-8-sig")
     shifted_signal.reset_index().to_csv(full_dir / "trade_signal.csv", index=False, encoding="utf-8-sig")
     signal_diag = _signal_coverage_diagnostics(shifted_signal, cal)
