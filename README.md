@@ -2,20 +2,9 @@
 
 **流程图：Stage1→Stage6 概览**
 
-```mermaid
-flowchart TD
-  A[Stage1<br/>数据准备] --> B[Stage2<br/>训练预测模型]
-  B --> C[Stage3<br/>信号后处理/过滤]
-  C --> D[Stage4<br/>组合构建/持仓权重]
-  D --> E[Stage5<br/>回测/交易模拟]
-  E --> F[Stage6<br/>分析与汇总]
-  style A fill:#e8f4ff,stroke:#1f77b4,stroke-width:2px
-  style B fill:#e8f7ef,stroke:#2ca02c,stroke-width:2px
-  style C fill:#fff7e6,stroke:#ff7f0e,stroke-width:2px
-  style D fill:#f0f8ff,stroke:#9467bd,stroke-width:2px
-  style E fill:#f6f6f6,stroke:#7f7f7f,stroke-width:2px
-  style F fill:#fff0f3,stroke:#d62728,stroke-width:2px
-```
+![量化选股流程](docs/quant_flow.png)
+
+注：图片文件位于 `docs/quant_flow.png`。如果仓库中尚无此图片，请将你提供的流程图保存为 `docs/quant_flow.png` 并提交到仓库，或告诉我我可以帮你把图片添加到该路径。
 
 本文档面向小白用户，覆盖：环境搭建（使用镜像 `zhuhai123/qlib-rdagent:v1`）、Qlib 数据获取、以及如何使用仓库内的 `run_alpha158_practice` 脚本顺序执行 stage1→stage6（并说明每个步骤做了什么与输出结果存放位置）。
 

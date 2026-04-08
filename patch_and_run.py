@@ -53,7 +53,9 @@ except Exception as e:
         f.write('[PATCH ERROR] ' + str(e) + '\n')
 # set env and run one round
 os.environ.setdefault('OPENAI_API_BASE', 'https://open.bigmodel.cn/api/paas/v4')
-os.environ.setdefault('OPENAI_API_KEY', '086fd27dd6184f80bc04172021661edf.CPUClMiDSGqqVwpe')
+# Do NOT hardcode API keys in repository files. Read OPENAI_API_KEY only from
+# the external environment. If not set, leave empty so callers can detect missing key.
+os.environ.setdefault('OPENAI_API_KEY', os.environ.get('OPENAI_API_KEY', ''))
 os.environ.setdefault('CHAT_MODEL', 'openai/glm-4.7')
 os.environ.setdefault('RDAGENT_MAX_ROUNDS', '1')
 os.environ.setdefault('BIGMODEL_MIN_INTERVAL', '25')
