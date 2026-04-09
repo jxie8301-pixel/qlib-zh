@@ -5,6 +5,8 @@ stage4_risk_eval.py
     1. 财务标签  (优 / 良 / 中 / 差)
     2. 估值标签  (高 / 中 / 低)
     3. 风险标签  (高 / 中 / 低)
+    4. 额外输出连续化的 financial_score / valuation_score / risk_score，
+       更接近机构实盘里“先约束、再排序”的做法
 数据源：baostock 公共接口
 说明：
   - 利润、偿债、营运、成长、杜邦、业绩快报用于财务评分
@@ -121,6 +123,68 @@ def _valuation_label(pe: float, pb: float, ps: float) -> str:
     if low / total >= 0.5:
         return "低"
     return "中"
+
+
+def _cross_sectional_valuation_score(frame: pd.DataFrame, industry_col: str = "industry") -> pd.Series:
+    """Cross-sectional valuation score: higher is better / cheaper.
+
+    Uses industry-relative percentiles when an industry group is large enough;
+    otherwise falls back to the full candidate pool.
+    """
+    if frame.empty:
+        return pd.Series(dtype=float)
+
+    def _score_one(group: pd.DataFrame) -> pd.Series:
+        score = pd.Series(0.0, index=group.index, dtype=float)
+        total_weight = 0.0
+        # Lower is better for valuation multiples.
+        for col, weight in [("pe_ttm", 0.40), ("pb", 0.35), ("ps", 0.25)]:
+            s = pd.to_numeric(group.get(col), errors="coerce")
+            if s.notna().sum() < 3:
+                continue
+            pct = s.rank(pct=True, method="average")
+            # Cheap -> higher score.
+            comp = (1.0 - pct).clip(0.0, 1.0).fillna(0.5)
+            score = score + comp * weight
+            total_weight += weight
+        if total_weight <= 0:
+            return pd.Series(50.0, index=group.index, dtype=float)
+        return (score / total_weight * 100).clip(0.0, 100.0)
+
+    global_score = _score_one(frame)
+    out = global_score.copy()
+    if industry_col in frame.columns:
+        for _, idx in frame.groupby(frame[industry_col].fillna("未知")).groups.items():
+            if len(idx) >= 5:
+                out.loc[idx] = _score_one(frame.loc[idx])
+    return out
+
+
+def _continuous_risk_score(frame: pd.DataFrame) -> pd.Series:
+    """Higher score means higher risk."""
+    if frame.empty:
+        return pd.Series(dtype=float)
+
+    fin = pd.to_numeric(frame.get("financial_score"), errors="coerce").fillna(50.0)
+    val = pd.to_numeric(frame.get("valuation_score"), errors="coerce").fillna(50.0)
+    news = pd.to_numeric(frame.get("negative_news_count"), errors="coerce").fillna(0.0).clip(0.0, 3.0)
+    is_st = frame.get("is_st", pd.Series(False, index=frame.index)).astype(bool)
+    is_suspended = frame.get("is_suspended", pd.Series(False, index=frame.index)).astype(bool)
+
+    fin_penalty = (1.0 - fin / 100.0).clip(0.0, 1.0)
+    val_penalty = (1.0 - val / 100.0).clip(0.0, 1.0)
+    news_penalty = (news / 3.0).clip(0.0, 1.0)
+    st_penalty = is_st.astype(float)
+    trade_penalty = is_suspended.astype(float)
+
+    risk = 100.0 * (
+        0.35 * fin_penalty
+        + 0.25 * val_penalty
+        + 0.20 * news_penalty
+        + 0.10 * st_penalty
+        + 0.10 * trade_penalty
+    )
+    return risk.clip(0.0, 100.0)
 
 
 def _risk_label(financial_label: str, valuation_label: str, negative_news_count: int, is_st: bool, is_suspended: bool, tradestatus: bool) -> str:
@@ -419,12 +483,40 @@ def risk_eval(input_csv: str, output_dir: str, pred_date: str):
             })
 
         result = pd.DataFrame(rows)
+        if result.empty:
+            out_csv = out_path / "risk_eval.csv"
+            result.to_csv(out_csv, index=False, encoding="utf-8-sig")
+            print(f"\n⚠ 风险评估结果为空，已保存空表: {out_csv}")
+            return
+
+        for col in ["financial_score", "pe_ttm", "pb", "ps", "negative_news_count"]:
+            if col in result.columns:
+                result[col] = pd.to_numeric(result[col], errors="coerce")
+        result["is_st"] = pd.Series(result.get("is_st", False), index=result.index).fillna(False).astype(bool)
+        result["is_suspended"] = pd.Series(result.get("is_suspended", False), index=result.index).fillna(False).astype(bool)
+
+        # Institutional-style continuous scores: cheap + quality + news + tradability.
+        result["valuation_score"] = _cross_sectional_valuation_score(result)
+        result["risk_score"] = _continuous_risk_score(result)
+
+        # Keep legacy labels for downstream stage5 compatibility.
+        result["valuation_label"] = np.where(
+            result["valuation_score"] >= 70,
+            "低",
+            np.where(result["valuation_score"] <= 30, "高", "中"),
+        )
+        result["risk_label"] = np.where(
+            result["risk_score"] >= 60,
+            "高",
+            np.where(result["risk_score"] >= 30, "中", "低"),
+        )
+
         out_csv = out_path / "risk_eval.csv"
         result.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
         print(f"\n✓ 风险评估耗时 {time.perf_counter() - t0:.1f}s")
         print("\n◆ 风险评估完毕:")
-        display_cols = [c for c in ["code", "financial_label", "valuation_label", "risk_label", "financial_score", "negative_news_count", "pe_ttm", "pb", "ps"] if c in result.columns]
+        display_cols = [c for c in ["code", "financial_label", "valuation_label", "risk_label", "financial_score", "valuation_score", "risk_score", "negative_news_count", "pe_ttm", "pb", "ps"] if c in result.columns]
         print(result[display_cols].to_string(index=False))
         print(f"\n✓ 风险评估保存: {out_csv}")
     finally:

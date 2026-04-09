@@ -3,11 +3,12 @@
 stage5_second_screen.py
 二筛：
     1. 从 risk_eval 读取财务 / 风险 / 估值标签
-    2. 过滤掉 财务差 / 高风险 / 高估值 的股票
-    3. 从 model_predict/scores.csv 补充 score / rank / percentile /
+    2. 先做硬约束：高风险、ST、停牌剔除
+    3. 再用财务 / 估值 / 风险 / 负面公告做软惩罚
+    4. 从 model_predict/scores.csv 补充 score / rank / percentile /
          annualized_return / max_drawdown / sharpe_ratio / ICIR / monthly_win_rate
-    4. 以模型分数为主，叠加 IC、稳定性、近期表现构建综合分
-    5. 取 Top-K 进入目标组合
+    5. 以模型分数为主，叠加 IC、稳定性、近期表现与基本面惩罚构建综合分
+    6. 取 Top-K 进入目标组合
 输出: <output>/second_screen.csv
 """
 import argparse
@@ -33,6 +34,14 @@ def _risk_order(series: pd.Series) -> pd.Series:
 def _valuation_order(series: pd.Series) -> pd.Series:
     mapping = {"低": 0, "中": 1, "高": 2}
     return series.map(mapping).fillna(3)
+
+
+def _bool_series(series: pd.Series | None, index: pd.Index, default: bool = False) -> pd.Series:
+    if series is None:
+        return pd.Series(default, index=index)
+    if isinstance(series, pd.Series):
+        return series.fillna(default).astype(bool)
+    return pd.Series(default, index=index)
 
 
 def _normalize_industry(series: pd.Series) -> pd.Series:
@@ -115,14 +124,27 @@ def _history_volatility(codes: list[str], pred_date: str, lookback_days: int = 6
 
 def _apply_risk_parity_weights(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    score = pd.to_numeric(out.get("composite_score"), errors="coerce")
+    if score.notna().sum() > 1:
+        score_weight = _minmax(score)
+    else:
+        score_weight = pd.Series(1.0 / max(len(out), 1), index=out.index)
+
     vol = pd.to_numeric(out.get("volatility_60d"), errors="coerce")
     inv_vol = 1.0 / vol.replace(0, np.nan)
     inv_vol = inv_vol.replace([np.inf, -np.inf], np.nan)
     if inv_vol.notna().sum() == 0:
-        out["risk_parity_weight"] = 1.0 / max(len(out), 1)
+        combined = score_weight
     else:
         inv_vol = inv_vol.fillna(inv_vol.dropna().median() if inv_vol.notna().any() else 1.0)
-        out["risk_parity_weight"] = inv_vol / inv_vol.sum()
+        vol_weight = inv_vol / inv_vol.sum()
+        combined = 0.7 * score_weight + 0.3 * vol_weight
+
+    if combined.isna().all() or combined.sum() <= 0:
+        out["risk_parity_weight"] = 1.0 / max(len(out), 1)
+    else:
+        combined = combined.fillna(combined.dropna().median() if combined.notna().any() else 1.0)
+        out["risk_parity_weight"] = combined / combined.sum()
     out["weight"] = out["risk_parity_weight"]
     return out
 
@@ -171,19 +193,22 @@ def second_screen(risk_eval_csv: str, pred_dir: str,
         risk_df["code"] = _normalize_code(risk_df["code"])
     print(f"✓ 加载 risk_eval: {len(risk_df)} 只股票")
 
-    # ── 2. 过滤 财务差 / 高风险 / 高估值 ───────────
+    # ── 2. 先做硬约束：高风险 / ST / 停牌剔除 ──────
     before = len(risk_df)
+    is_st = _bool_series(risk_df["is_st"] if "is_st" in risk_df.columns else None, risk_df.index, default=False)
+    is_suspended = _bool_series(risk_df["is_suspended"] if "is_suspended" in risk_df.columns else None, risk_df.index, default=False)
+    risk_label = risk_df["risk_label"] if "risk_label" in risk_df.columns else pd.Series("中", index=risk_df.index)
     mask_ok = (
-        (risk_df.get("financial_label", "中") != "差") &
-        (risk_df["risk_label"] != "高") &
-        (risk_df["valuation_label"] != "高")
+        (risk_label != "高")
+        & (~is_st)
+        & (~is_suspended)
     )
     filtered = risk_df[mask_ok].copy()
-    print(f"✓ 过滤财务差/高风险/高估值: {before} → {len(filtered)} 只")
+    print(f"✓ 过滤高风险/ST/停牌: {before} → {len(filtered)} 只")
 
     if filtered.empty:
-        print("  ⚠ 过滤后无剩余股票！将放宽为仅排除高风险")
-        filtered = risk_df[risk_df["risk_label"] != "高"].copy()
+        print("  ⚠ 严格约束后无剩余股票，将放宽为仅排除停牌/ST")
+        filtered = risk_df[(~is_st) & (~is_suspended)].copy()
 
     # ── 3. 从 model_predict/scores.csv 补充得分信息 ─
     scores_csv = _resolve_scores_csv(pred_dir)
@@ -228,13 +253,25 @@ def second_screen(risk_eval_csv: str, pred_dir: str,
     result["_icir_norm"] = _minmax(result.get("ICIR", pd.Series(index=result.index, dtype=float)))
     result["_win_norm"] = _minmax(result.get("monthly_win_rate", pd.Series(index=result.index, dtype=float)))
     result["_score_norm"] = _minmax(result["_score"])
+    result["_fin_quality"] = _minmax(result.get("financial_score", pd.Series(index=result.index, dtype=float)))
+    result["_val_quality"] = _minmax(result.get("valuation_score", pd.Series(index=result.index, dtype=float)))
+    risk_score_series = pd.to_numeric(result.get("risk_score", pd.Series(50.0, index=result.index)), errors="coerce")
+    news_series = pd.to_numeric(result.get("negative_news_count", pd.Series(0.0, index=result.index)), errors="coerce").fillna(0.0)
+    result["_risk_quality"] = _minmax(100.0 - risk_score_series)
+    result["_news_quality"] = _minmax(3.0 - news_series)
+    result["_vol_quality"] = 1.0 - _minmax(result.get("volatility_60d", pd.Series(index=result.index, dtype=float)), ascending=True)
     result["composite_score"] = (
-        0.55 * result["_score_norm"]
-        + 0.15 * result["_icir_norm"]
-        + 0.10 * result["_sharpe_norm"]
-        + 0.10 * result["_ann_norm"]
+        0.42 * result["_score_norm"]
+        + 0.12 * result["_icir_norm"]
+        + 0.08 * result["_sharpe_norm"]
+        + 0.07 * result["_ann_norm"]
         + 0.05 * result["_win_norm"]
-        + 0.05 * result["_mdd_norm"]
+        + 0.04 * result["_mdd_norm"]
+        + 0.10 * result["_fin_quality"]
+        + 0.06 * result["_val_quality"]
+        + 0.04 * result["_risk_quality"]
+        + 0.02 * result["_news_quality"]
+        + 0.02 * result["_vol_quality"]
     )
     if "rank" in result.columns:
         result["rank"] = pd.to_numeric(result["rank"], errors="coerce")
@@ -267,6 +304,7 @@ def second_screen(risk_eval_csv: str, pred_dir: str,
     print(f"\n◆ 二筛完成，选出 {len(result)} 只股票:")
     display_cols = ["code", "score", "rank", "rank_pct",
                     "percentile", "composite_score", "volatility_60d", "risk_parity_weight", "financial_label", "valuation_label", "risk_label",
+                    "financial_score", "valuation_score", "risk_score",
                     "annualized_return", "max_drawdown", "sharpe_ratio", "ICIR", "monthly_win_rate"]
     display_cols = [c for c in display_cols if c in result.columns]
     print(result[display_cols].to_string(index=False))
