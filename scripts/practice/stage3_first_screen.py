@@ -4,8 +4,7 @@ stage3_first_screen.py
 初筛选股：
   1. 从沪深300（CSI300）成分股中
   2. 排除 ST、涨停/跌停、停牌、上市不足60天、日均成交额排名后20%
-  3. 排除股价 > 50 元的股票
-  4. 从初筛池中取模型得分最高的 top_n（默认20）支
+    3. 从初筛池中取模型得分最高的 top_n（默认20）支
 数据源：掘金量化 gm 免费数据
 输出: <output>/first_screen.csv
 """
@@ -328,14 +327,6 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
     pred_path = Path(pred_dir)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
-    affordability_cap = _affordable_price_cap()
-    if affordability_cap > 0:
-        if max_price <= 0:
-            max_price = affordability_cap
-        else:
-            max_price = min(max_price, affordability_cap)
-        print(f"✓ 按资金约束修正最高股价阈值: {max_price:.2f} 元/股")
-
     scores_csv = _resolve_scores_csv(pred_path)
     scores_df = pd.read_csv(scores_csv)
     if "pred_date" in scores_df.columns and not scores_df["pred_date"].dropna().empty:
@@ -386,12 +377,6 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
         print(f"✓ 排除涨跌停/停牌后剩余: {len(pool)} (移除 {before - len(pool)} 只)")
 
         before = len(pool)
-        pool["price"] = pool["code"].map({r["code"]: r["price"] for _, r in realtime.iterrows()})
-        pool = pool[pool["price"].fillna(0) <= max_price]
-        pool = pool[pool["price"].fillna(0) > 0]
-        print(f"✓ 排除股价>{max_price}元后剩余: {len(pool)} (移除 {before - len(pool)} 只)")
-
-        before = len(pool)
         turnover_map = _avg_turnover(gm, set(pool["code"].tolist()), pred_date)
         pool["avg_turnover"] = pool["code"].map(turnover_map)
         valid_turnover = pd.to_numeric(pool["avg_turnover"], errors="coerce").dropna()
@@ -402,7 +387,6 @@ def first_screen(pred_dir: str, output_dir: str, pred_date: str, top_n: int = 20
         else:
             print("  ⚠ 成交额数据不足，跳过后20%流动性过滤")
     else:
-        pool["price"] = float("nan")
         pool["avg_turnover"] = float("nan")
 
     pred_dt = pd.to_datetime(pred_date)
