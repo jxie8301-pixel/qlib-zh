@@ -1235,6 +1235,7 @@ def _write_full_backtest_report(
     from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy
     from qlib.config import C
     import qlib
+    import importlib
 
     # Use raw stage2 fold predictions only.
     signal_df = _build_full_signal(fold_outputs)
@@ -1353,6 +1354,62 @@ def _write_full_backtest_report(
     daily["drawdown"] = daily["equity_curve"] / daily["equity_curve"].cummax() - 1
     daily.to_csv(full_dir / "equity_curve.csv", encoding="utf-8-sig")
 
+    # ── Qlib native report figures ────────────────────────────────────────
+    native_report_figs: list = []
+    native_ic_figs: list = []
+    native_cumret_figs: list = []
+    native_rank_figs: list = []
+    try:
+        analysis_position = importlib.import_module("qlib.contrib.report.analysis_position")
+        native_report_figs = list(analysis_position.report_graph(report_normal, show_notebook=False))
+
+        # Build labels and positions for native IC / cumulative return / rank analysis.
+        from qlib.data import D
+
+        label_start = pd.to_datetime(signal_start).strftime("%Y-%m-%d")
+        label_end = pd.to_datetime(backtest_end).strftime("%Y-%m-%d")
+        trade_instruments = sorted(shifted_signal.index.get_level_values("instrument").astype(str).unique().tolist())
+        label_data = D.features(
+            trade_instruments,
+            ["Ref($close, -1)/$close - 1"],
+            start_time=label_start,
+            end_time=label_end,
+        )
+        if label_data is not None and not label_data.empty:
+            if isinstance(label_data, pd.Series):
+                label_data = label_data.to_frame("label")
+            else:
+                label_data = label_data.copy()
+                if label_data.shape[1] != 1:
+                    label_data = label_data.iloc[:, :1]
+                label_data.columns = ["label"]
+            label_data = label_data.dropna()
+
+            pred_label = shifted_signal.join(label_data, how="inner")
+            if not pred_label.empty:
+                native_ic_figs = list(analysis_position.score_ic_graph(pred_label, show_notebook=False))
+                native_cumret_figs = list(
+                    analysis_position.cumulative_return_graph(
+                        _positions_normal,
+                        report_normal,
+                        label_data,
+                        show_notebook=False,
+                        start_date=pd.to_datetime(trade_start).strftime("%Y-%m-%d"),
+                        end_date=pd.to_datetime(trade_end).strftime("%Y-%m-%d"),
+                    )
+                )
+                native_rank_figs = list(
+                    analysis_position.rank_label_graph(
+                        _positions_normal,
+                        label_data,
+                        start_date=pd.to_datetime(trade_start).strftime("%Y-%m-%d"),
+                        end_date=pd.to_datetime(trade_end).strftime("%Y-%m-%d"),
+                        show_notebook=False,
+                    )
+                )
+    except Exception as exc:
+        print(f"⚠ Qlib 原生图表生成失败: {exc}")
+
     fold_df = pd.DataFrame(fold_rows) if fold_rows else pd.DataFrame()
     ic_mean = float(pd.to_numeric(fold_df.get("IC_mean"), errors="coerce").mean()) if "IC_mean" in fold_df else float("nan")
     ic_std = float(pd.to_numeric(fold_df.get("IC_mean"), errors="coerce").std()) if "IC_mean" in fold_df else float("nan")
@@ -1409,11 +1466,37 @@ def _write_full_backtest_report(
     summary_lines.append(f"Expert commentary: {commentary}")
     report_txt.write_text("\n".join(summary_lines), encoding="utf-8")
 
+    def _fig_block(fig) -> str:
+        try:
+            return fig.to_html(full_html=False, include_plotlyjs=False)
+        except Exception:
+            return ""
+
+    sections_html = []
+    all_figs = [
+        ("组合回测报告", native_report_figs, "qlib.contrib.report.analysis_position.report_graph"),
+        ("Score IC 分析", native_ic_figs, "qlib.contrib.report.analysis_position.score_ic_graph"),
+        ("买卖持有累计收益", native_cumret_figs, "qlib.contrib.report.analysis_position.cumulative_return_graph"),
+        ("持仓标签分位", native_rank_figs, "qlib.contrib.report.analysis_position.rank_label_graph"),
+    ]
+    for title, figs, desc in all_figs:
+        parts = ["<div class=\"card\">", f"<h2>{title}</h2>", f"<div class=\"muted\">{desc}</div>"]
+        if figs:
+            for fig in figs:
+                parts.append('<div style="margin-top:16px;">')
+                parts.append(_fig_block(fig))
+                parts.append("</div>")
+        else:
+            parts.append("<div class=\"muted\">无可用图表。</div>")
+        parts.append("</div>")
+        sections_html.append("\n".join(parts))
+
     html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <title>Full-cycle Backtest Overview</title>
+    <script src="https://cdn.plot.ly/plotly-3.4.0.min.js"></script>
   <style>
     body {{ font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif; margin: 24px; color: #1f2937; }}
     table {{ border-collapse: collapse; width: 100%; }}
@@ -1425,27 +1508,24 @@ def _write_full_backtest_report(
 </head>
 <body>
     <h1>Full-cycle Top{hold_num} Walk-forward Backtest</h1>
-    <div class="muted">Aggregated from fold-level OOS predictions. When signal coverage is sparse, treat these metrics as sparse-signal replay diagnostics.</div>
-  <div class="card">
-    <h2>Metrics</h2>
-    <table>
-      {''.join(f'<tr><th>{k}</th><td>{v:.6f}</td></tr>' for k, v in metrics.items())}
-    </table>
-  </div>
+        <div class="muted">Aggregated from fold-level OOS predictions. This page now uses Qlib native report graphs.</div>
     <div class="card">
-        <h2>Signal coverage diagnostics</h2>
+        <h2>Metrics</h2>
         <table>
-            <tr><th>trade_signal_dates</th><td>{int(signal_diag['trade_signal_dates'])}</td></tr>
-            <tr><th>calendar_days</th><td>{int(signal_diag['calendar_days'])}</td></tr>
-            <tr><th>signal_coverage_ratio</th><td>{signal_diag['signal_coverage_ratio']:.6f}</td></tr>
-            <tr><th>median_gap_days</th><td>{signal_diag['median_gap_days']:.2f}</td></tr>
-            <tr><th>max_gap_days</th><td>{signal_diag['max_gap_days']:.2f}</td></tr>
+            {''.join(f'<tr><th>{k}</th><td>{v:.6f}</td></tr>' for k, v in metrics.items())}
         </table>
     </div>
-  <div class="card">
-    <h2>Daily report sample</h2>
-    {daily.head(30).to_html(classes='table table-sm table-striped')}
-  </div>
+        <div class="card">
+                <h2>Signal coverage diagnostics</h2>
+                <table>
+                        <tr><th>trade_signal_dates</th><td>{int(signal_diag['trade_signal_dates'])}</td></tr>
+                        <tr><th>calendar_days</th><td>{int(signal_diag['calendar_days'])}</td></tr>
+                        <tr><th>signal_coverage_ratio</th><td>{signal_diag['signal_coverage_ratio']:.6f}</td></tr>
+                        <tr><th>median_gap_days</th><td>{signal_diag['median_gap_days']:.2f}</td></tr>
+                        <tr><th>max_gap_days</th><td>{signal_diag['max_gap_days']:.2f}</td></tr>
+                </table>
+        </div>
+    {''.join(sections_html)}
 </body>
 </html>
 """

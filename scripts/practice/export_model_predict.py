@@ -14,6 +14,7 @@ import math
 import pickle
 import os
 import sys
+import subprocess
 from pathlib import Path
 import warnings
 
@@ -93,6 +94,19 @@ def _load_qlib_report_modules():
         analysis_position = importlib.import_module("qlib.contrib.report.analysis_position")
         analysis_model = importlib.import_module("qlib.contrib.report.analysis_model")
     except Exception as exc:  # pragma: no cover - environment dependent
+        missing_name = getattr(exc, "name", "") or str(exc)
+        if "statsmodels" in missing_name and "statsmodels" not in sys.modules:
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-q", "statsmodels"],
+                    check=True,
+                )
+                analysis_position = importlib.import_module("qlib.contrib.report.analysis_position")
+                analysis_model = importlib.import_module("qlib.contrib.report.analysis_model")
+                _ANALYSIS_IMPORT_ERROR = None
+                return analysis_position, analysis_model
+            except Exception as retry_exc:  # pragma: no cover - environment dependent
+                exc = retry_exc
         _ANALYSIS_IMPORT_ERROR = exc
         analysis_position = None
         analysis_model = None
