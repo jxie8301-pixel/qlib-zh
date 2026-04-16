@@ -250,12 +250,3 @@ docker run --rm -it \
   - 请从仓库中删除任何包含密钥的历史提交（如果之前已提交敏感信息，请用 git-filter-repo 或 BFG 清理历史，并在凭证泄露后及时在 provider 侧撤销旧 key）。
   - 在本仓库我们已将 `patch_and_run.py` 中的硬编码默认 key 移除，改为从环境变量读取（请在运行时确保 `OPENAI_API_KEY` 已设置）。
 
----
-
-如果你希望，我可以：
-
-- 为你把 `OPENAI_API_KEY` 从任何其他仓库文件中彻底移除（并列出受影响的文件）；
-- 或把 `scripts/run_fin_factor_with_cap.py` 的调试 stub 示例提炼成一个更明显的 `README` 示例段落以便开发者快速上手。
-
----
-
