@@ -57,6 +57,10 @@ except ImportError:
 
 
 ROOT = Path(__file__).resolve().parents[2]
+# Ensure repo root is on sys.path so `from scripts.small.cached_handler import ...`
+# works both when called directly (run_alpha158_practice) and via importlib (run_alpha158_small).
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 SCRIPTS = ROOT / "scripts" / "practice"
 WARM_START_STRATEGY = "previous_fold_checkpoint_v1"
 MODEL_SPECS = [
@@ -71,6 +75,12 @@ MODEL_SPECS = [
         "model_mode": "robust",
     },
 ]
+
+# Allow lightgbm_only mode via env var (skips XGBoost training for faster runs)
+if str(os.environ.get("STAGE2_LIGHTGBM_ONLY", "0")).strip().lower() in ("1", "true", "yes"):
+    MODEL_SPECS = [s for s in MODEL_SPECS if s["name"] == "lightgbm"]
+    if not MODEL_SPECS:
+        raise RuntimeError("STAGE2_LIGHTGBM_ONLY is set but no lightgbm model found in MODEL_SPECS")
 
 
 def _target_route_model_names() -> list[str]:
@@ -853,10 +863,16 @@ def _precompute_handler_cache(
     template_cfg: dict,
     start_time: str,
     end_time: str,
+    provider_uri: str = "",
+    workers: int = 1,
 ) -> None:
-    """Precompute Alpha158 features for the full date range and save to disk (Parquet).
+    """Precompute Alpha158 features for the full date range and save to disk (pickle).
 
     Must be called after qlib.init() (i.e. after _load_trade_calendar).
+
+    When ``workers > 1``, instruments are split across parallel subprocesses,
+    each handling a chunk of stocks independently.  This is 3-4× faster on
+    multi-core machines for the initial cache build.
 
     This is inlined from ``scripts.small.cached_handler`` to avoid import failures
     when this module is loaded via ``importlib.spec_from_file_location()`` (the
@@ -864,6 +880,7 @@ def _precompute_handler_cache(
     on ``sys.path``.
     """
     import copy
+    import os as _os
 
     from qlib.data.dataset.handler import DataHandlerLP
     from qlib.utils import init_instance_by_config
@@ -873,6 +890,22 @@ def _precompute_handler_cache(
     except KeyError:
         raise RuntimeError("Cannot find handler config in template")
 
+    # Override instruments from TARGET_MARKET env var (respects DEBUG / custom markets)
+    target_market = _os.environ.get("TARGET_MARKET", "")
+    if target_market:
+        handler_cfg = copy.deepcopy(handler_cfg)
+        handler_cfg.setdefault("kwargs", {})["instruments"] = target_market
+
+    if workers > 1:
+        from scripts.small.cached_handler import _precompute_handler_cache_parallel
+        _precompute_handler_cache_parallel(
+            cache_path, template_cfg, handler_cfg,
+            start_time, end_time, provider_uri, workers,
+        )
+        return
+
+    # ── Serial path (original) ──────────────────────────────────
+    from scripts.small.cached_handler import _dump_cached_data
     handler_cfg = copy.deepcopy(handler_cfg)
     handler_cfg["kwargs"]["start_time"] = start_time
     handler_cfg["kwargs"]["end_time"] = end_time
@@ -880,41 +913,19 @@ def _precompute_handler_cache(
     handler_cfg["kwargs"]["fit_end_time"] = end_time
 
     handler = init_instance_by_config(handler_cfg)
-    import os as _os
-    _os.system("echo 'DEBUG: setup_data starting' >> /tmp/cache_debug.log")
     handler.setup_data(DataHandlerLP.IT_FIT_SEQ)
-    _os.system("echo 'DEBUG: setup_data done' >> /tmp/cache_debug.log")
 
     if handler._data is None or handler._data.empty:
-        _os.system("echo 'DEBUG: _data is None or empty' >> /tmp/cache_debug.log")
         raise RuntimeError("Handler produced empty _data — cannot cache")
-    _os.system("echo 'DEBUG: _data OK, calling _dump_cached_data' >> /tmp/cache_debug.log")
 
     _dump_cached_data(handler._data, cache_path)
-    _os.system("echo 'DEBUG: _dump_cached_data returned' >> /tmp/cache_debug.log")
     n_rows = len(handler._data)
     n_dates = handler._data.index.get_level_values("datetime").nunique()
     n_inst = handler._data.index.get_level_values("instrument").nunique()
     print(f"  [Cache] Saved {n_rows} rows ({n_dates} dates × {n_inst} inst) → {cache_path}")
 
 
-def _dump_cached_data(df, path):
-    """Save a MultiIndex (datetime, instrument) DataFrame to disk (pickle).
 
-    Pickle is used instead of parquet for reliability with wide DataFrames
-    (200+ features × thousands of dates/stocks).  Parquet+zstd was found to
-    hang on large AlphaExtra datasets due to memory pressure.  The meta.json
-    file is written by the caller after this returns.
-    """
-    import os
-    path = str(path)
-    n_rows = len(df)
-    print(f"  [Cache] Saving {n_rows} rows to {os.path.basename(path)} ...", flush=True)
-    df_to_save = df.reset_index()
-    if isinstance(df_to_save.columns, pd.MultiIndex):
-        df_to_save.columns = [str(col) for col in df_to_save.columns]
-    df_to_save.to_pickle(path)
-    print(f"  [Cache] Pickle save done ({os.path.basename(path)})", flush=True)
 
 def _train_single_model_fold(
     spec: dict[str, object],
@@ -3411,6 +3422,10 @@ def main() -> None:
                     help="Skip training, load latest fold's model checkpoint and predict only")
     ap.add_argument("--pred-date", default=None,
                     help="Override prediction date for predict-only mode (YYYY-MM-DD)")
+    ap.add_argument("--cache-only", action="store_true", default=False,
+                    help="Only precompute handler feature cache, then exit (stage1)")
+    ap.add_argument("--cache-workers", type=int, default=1,
+                    help="Number of parallel workers for cache precompute (default: 1 = serial)")
     args = ap.parse_args()
 
     template_path = Path(args.template)
@@ -3553,9 +3568,15 @@ def main() -> None:
         _precompute_handler_cache(
             handler_cache_path, template_cfg,
             args.train_base_start, effective_end_str,
+            provider_uri=_resolve_provider_dir(template_cfg) or "",
+            workers=args.cache_workers,
         )
         handler_cache_meta.write_text(json.dumps({"end_date": effective_end_str, "start_date": args.train_base_start}))
     args.handler_cache = handler_cache_path
+
+    if args.cache_only:
+        print("  [Cache] --cache-only: precompute complete, exiting.")
+        return
 
     segment_groups = _group_folds_by_year(folds, args.segment_years)
     fold_index = 0

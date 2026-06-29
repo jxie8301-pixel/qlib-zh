@@ -232,23 +232,18 @@ def _load_data(
     if not Path(path).exists():
         return None
     try:
-        # Try pickle first (primary format; also catch renamed .parquet files)
         _ext = Path(path).suffix.lower()
-        if _ext in (".pkl", ".pickle", ".parquet"):
-            if _PARQUET_OK and _ext == ".parquet":
-                import pyarrow.parquet as pq
-                with redirect_stdout(open(os.devnull, "w")):
-                    table = pq.read_table(path)
-                    df = table.to_pandas()
-            else:
-                df = pd.read_pickle(path)
+        if _ext in (".pkl", ".pickle"):
+            df = pd.read_pickle(path)
+        elif _PARQUET_OK and _ext == ".parquet":
+            import pyarrow.parquet as pq
+            with redirect_stdout(open(os.devnull, "w")):
+                table = pq.read_table(path)
+                df = table.to_pandas()
         else:
             df = pd.read_pickle(path)
 
-        # Normalize MultiIndex columns to plain strings.
-        # pyarrow's table.to_pandas() may or may not reconstruct the MultiIndex
-        # column structure from the parquet metadata depending on the version.
-        # Flattening here ensures consistent column name format for _find_col.
+        # Normalize MultiIndex columns
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [str(col) for col in df.columns]
 
@@ -265,15 +260,12 @@ def _load_data(
         if date_col and inst_col:
             df = df.set_index([date_col, inst_col])
             df.index = df.index.set_names(["datetime", "instrument"])
+            df = df.sort_index()
 
         # Rebuild tuple columns from string reprs if needed
-        # e.g. "('feature', 'KMID')" → ("feature", "KMID")
         _rebuild_tuple_columns(df)
 
         # Convert tuple columns to proper MultiIndex for downstream compatibility.
-        # After _rebuild_tuple_columns, columns are a flat Index of tuples like
-        # ('feature', 'KMD').  qlib processors (e.g. CSZScoreNorm) call
-        # df.columns.get_loc('feature') which requires a proper MultiIndex.
         if len(df.columns) > 0 and isinstance(df.columns[0], tuple):
             df.columns = pd.MultiIndex.from_tuples(df.columns)
 
@@ -343,3 +335,115 @@ def _find_col(df: pd.DataFrame, key: str) -> str | None:
             except Exception:
                 pass
     return None
+
+
+# ── Parallel precomputation (moved from run_stage2_walk_forward.py for pickle safety) ──
+
+
+def _dump_cached_data(df, path):
+    """Save a MultiIndex (datetime, instrument) DataFrame to disk (pickle)."""
+    import os
+    path = str(path)
+    n_rows = len(df)
+    print(f"  [Cache] Saving {n_rows} rows to {os.path.basename(path)} ...", flush=True)
+    df_to_save = df.reset_index()
+    if isinstance(df_to_save.columns, pd.MultiIndex):
+        df_to_save.columns = [str(col) for col in df_to_save.columns]
+    df_to_save.to_pickle(path)
+    print(f"  [Cache] Pickle save done ({os.path.basename(path)})", flush=True)
+
+
+def _precompute_worker(
+    provider_uri: str,
+    handler_cfg: dict,
+    instruments: list[str],
+    start_time: str,
+    end_time: str,
+    chunk_id: int,
+) -> "pd.DataFrame":
+    """Worker process: compute Alpha158 features for one chunk of instruments.
+
+    Passes instruments as a Python list directly — no temp files needed.
+    Qlib's D.instruments(list) and D.features(instruments=list) both accept
+    list arguments natively.
+    """
+    import copy
+    import qlib
+    from qlib.data.dataset.handler import DataHandlerLP
+    from qlib.utils import init_instance_by_config
+
+    qlib.init(provider_uri=provider_uri)
+
+    cfg = copy.deepcopy(handler_cfg)
+    kw = cfg.setdefault("kwargs", {})
+    kw["start_time"] = start_time
+    kw["end_time"] = end_time
+    kw["fit_start_time"] = start_time
+    kw["fit_end_time"] = end_time
+    kw["instruments"] = instruments
+
+    handler = init_instance_by_config(cfg)
+    handler.setup_data(DataHandlerLP.IT_FIT_SEQ)
+
+    df = handler._data.copy()
+    print(f"  [Worker {chunk_id}] {len(df)} rows ({len(instruments)} instruments)", flush=True)
+    return df
+
+
+def _precompute_handler_cache_parallel(
+    cache_path: str,
+    template_cfg: dict,
+    handler_cfg: dict,
+    start_time: str,
+    end_time: str,
+    provider_uri: str,
+    workers: int,
+    chunk_size: int = 200,
+) -> None:
+    """Split instruments across subprocesses, compute features, combine.
+
+    Instruments are split into chunks of ``chunk_size`` (default 200) to limit
+    per-worker memory usage.  ``workers`` controls the maximum number of
+    concurrent subprocesses — total chunks may exceed workers to bound memory.
+    """
+    import copy
+    from concurrent.futures import ProcessPoolExecutor
+
+    import pandas as pd
+
+    from qlib.data import D
+
+    inst_setting = handler_cfg.get("kwargs", {}).get("instruments", "all")
+    if isinstance(inst_setting, str):
+        instruments = D.list_instruments(D.instruments(market=inst_setting), freq="day", as_list=True)
+    else:
+        instruments = D.list_instruments(D.instruments(market="all"), freq="day", as_list=True)
+
+    if not instruments:
+        raise RuntimeError("No instruments found — cannot precompute cache")
+
+    chunks = [instruments[i:i + chunk_size] for i in range(0, len(instruments), chunk_size)]
+    chunks = [c for c in chunks if c]
+    max_workers = min(workers, len(chunks))
+
+    print(f"  [Cache] Parallel precompute: {len(instruments)} instruments → "
+          f"{len(chunks)} chunks (≤{chunk_size} inst/chunk) × {max_workers} concurrent workers")
+
+    worker_cfg = copy.deepcopy(handler_cfg)
+
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = [
+            ex.submit(_precompute_worker, provider_uri, worker_cfg, chunk,
+                       start_time, end_time, i)
+            for i, chunk in enumerate(chunks)
+        ]
+        results = [f.result() for f in futures]
+
+    combined = pd.concat(results, axis=0)
+    n_rows = len(combined)
+    n_dates = combined.index.get_level_values("datetime").nunique()
+    n_inst = combined.index.get_level_values("instrument").nunique()
+    print(f"  [Cache] Combined: {n_rows} rows ({n_dates} dates × {n_inst} inst)")
+
+    _dump_cached_data(combined, cache_path)
+    print(f"  [Cache] Saved → {cache_path}")
